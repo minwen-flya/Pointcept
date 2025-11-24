@@ -1,0 +1,4 @@
+0	bulk_carrier_cargo_tank
+1	deck
+2	tanker_ballast_tank
+3	tanker_cargo_tank

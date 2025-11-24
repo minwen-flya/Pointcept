@@ -90,3 +90,6 @@ $PYTHON -u tools/$TEST_CODE \
   --machine-rank ${SLURM_NODEID:-0} \
   --dist-url ${DIST_URL} \
   --options save_path="$EXP_DIR" weight="${MODEL_DIR}"/"${WEIGHT}".pth
+
+# sh scripts/train.sh -m 1 -g 1 -d sonata -c semseg-sonata-v1m1-0a-flya-lin -n semseg-sonata-v1m1-0-base-0a-flya-lin -w exp/sonata/pretrain-sonata-v1m1-0-base/model/pretrain-sonata-v1m1-0-base.pth 
+

@@ -79,7 +79,7 @@ echo " =========> CREATE EXP DIR <========="
 echo "Experiment dir: $ROOT_DIR/$EXP_DIR"
 if [ "${RESUME}" = true ] && [ -d "$EXP_DIR" ]
 then
-  CONFIG_DIR=${EXP_DIR}/config.py
+    CONFIG_DIR=${EXP_DIR}/config.py
   WEIGHT=$MODEL_DIR/model_last.pth
 else
   RESUME=false
@@ -104,6 +104,7 @@ then
     --dist-url ${DIST_URL} \
     --options save_path="$EXP_DIR"
 else
+    echo "weight loaded"
     $PYTHON "$CODE_DIR"/tools/$TRAIN_CODE \
     --config-file "$CONFIG_DIR" \
     --num-gpus "$NUM_GPU" \
@@ -112,3 +113,5 @@ else
     --dist-url ${DIST_URL} \
     --options save_path="$EXP_DIR" resume="$RESUME" weight="$WEIGHT"
 fi
+
+#  sh scripts/train.sh -m 1 -g 1 -d sonata -c semseg-sonata-v1m1-0a-flya-lin -n semseg-sonata-v1m1-0-base-0a-flya-lin -w exp/sonata/pretrain-sonata-v1m1-0-base/model/pretrain-sonata-v1m1-0-base.pth 
