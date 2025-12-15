@@ -130,13 +130,19 @@ class SemSegEvaluator(HookBase):
     def eval(self):
         self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
+        model_mem = torch.cuda.memory_allocated() / (1024 * 1024)
+        print(f"Model already uses: {model_mem:.2f} MB")
         for i, input_dict in enumerate(self.trainer.val_loader):
             for key in input_dict.keys():
                 if isinstance(input_dict[key], torch.Tensor):
                     input_dict[key] = input_dict[key].cuda(non_blocking=True)
+            after = torch.cuda.memory_allocated() / (1024 * 1024)
+            print(f"After moving input to GPU: {after:.2f} MB")
             with torch.no_grad():
                 output_dict = self.trainer.model(input_dict)
             output = output_dict["seg_logits"]
+            after = torch.cuda.memory_allocated() / (1024 * 1024)
+            print(f"After forward pass: {after:.2f} MB")
             loss = output_dict["loss"]
             pred = output.max(1)[1]
             segment = input_dict["segment"]
@@ -181,6 +187,9 @@ class SemSegEvaluator(HookBase):
         target = self.trainer.storage.history("val_target").total
         iou_class = intersection / (union + 1e-10)
         acc_class = intersection / (target + 1e-10)
+        print("num of valid classes:", np.sum(target > 1e-3))
+        m_iou = np.mean(iou_class, where=target > 1e-3)
+        m_acc = np.mean(acc_class, where=target > 1e-3)
         m_iou = np.mean(iou_class)
         m_acc = np.mean(acc_class)
         all_acc = sum(intersection) / (sum(target) + 1e-10)

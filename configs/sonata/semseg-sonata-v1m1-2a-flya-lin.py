@@ -2,7 +2,7 @@ _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
 batch_size = 1  # bs: total bs in all gpus
-num_worker = 32
+num_worker = 1
 mix_prob = 0.8
 clip_grad = 3.0
 empty_cache = False
@@ -11,7 +11,7 @@ enable_amp = True
 # model settings
 model = dict(
     type="DefaultSegmentorV2",
-    num_classes=3,
+    num_classes=18,
     backbone_out_channels=1232,
     backbone=dict(
         type="PT-v3m2",
@@ -47,7 +47,7 @@ model = dict(
 )
 
 # scheduler settings
-epoch = 1000
+epoch = 100
 optimizer = dict(type="AdamW", lr=0.002, weight_decay=0.02)
 scheduler = dict(
     type="OneCycleLR",
@@ -61,16 +61,32 @@ param_dicts = [dict(keyword="block", lr=0.0002)]
 
 # dataset settings
 dataset_type = "DefaultDataset"
-data_root = "data/flya_ship"
+data_root = "data/Pointcept_data/flya_ship_place_v1_ignore"
 
 data = dict(
-    num_classes=3,
+    num_classes=18,
     ignore_index=-1,
     names=[
-        "bulk_carrier_cargo_tank",
-        "deck",
-        "tanker_ballast_tank",
-        "tanker_cargo_tank",
+        # "outlier",
+        "pipe",
+        "ladder",
+        # "deck",
+        "bracket",
+        "side shell plating",
+        "inner seperate plating",
+        "inner side plating",
+        "inner bottom plating",
+        "longitudinal web",
+        "transverse web",
+        "deck plating",
+        "hopper plating",
+        "bottom shell plating",
+        "bulkheads",
+        "horizontal girder",
+        "longitudinals",
+        "frames",
+        "transverse stiffners",
+        "inner ceiling plating",
     ],
     train=dict(
         type=dataset_type,
@@ -143,7 +159,7 @@ data = dict(
     ),
     test=dict(
         type=dataset_type,
-        split="val",
+        split=["val", "test"],
         data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),

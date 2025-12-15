@@ -197,7 +197,7 @@ def estimate_normals(coord: np.ndarray) -> np.ndarray:
 
 
 def handle_process(
-    ply_path: str, output_path, mapping, train_scenes, val_scenes, voxel_size=None
+    ply_path: str, output_path, mapping, train_scenes, val_scenes, test_scenes, voxel_size=None, need_label=True
 ):
     scene_id = Path(ply_path).parent.name
     data_name = scene_id
@@ -210,9 +210,11 @@ def handle_process(
     elif scene_id in val_scenes:
         output_folder = output_path / 'val' / data_name
         split = 'val'
-    else:
+    elif scene_id in test_scenes:
         output_folder = output_path / 'test' / data_name
         split = 'test'
+    else:
+        return
 
     # Create the output directory if it doesn't exist
     os.makedirs(output_folder, exist_ok=True)
@@ -225,12 +227,19 @@ def handle_process(
     pc = pcd_ply.point
 
     coords = pc['positions'].numpy()
-    try:
-        vertex_labels = pc['label'].numpy()
-    except KeyError:
-        # skip this file if no label
-        return None
-    colors = np.zeros_like(coords, dtype=int)
+    if need_label:
+        try:
+            vertex_labels = pc['semantic_id'].numpy()
+        except KeyError:
+            # skip this file if no label
+            return None
+    else:
+        vertex_labels = np.zeros(coords.shape[0], dtype=np.int8)
+    if 'colors' not in pc:
+        colors = np.zeros_like(coords)
+        print(f'No color info in {ply_path}')
+    else:
+        colors = pc['colors'].numpy()
     normals = pc['normals'].numpy()
 
     if voxel_size is not None:
@@ -245,7 +254,15 @@ def handle_process(
         )
 
     if mapping is not None:
-        vertex_labels = np.vectorize(mapping.get)(vertex_labels, vertex_labels)
+        unique_labels = np.unique(vertex_labels)
+        missing = [l for l in unique_labels if l not in mapping]
+        if len(missing) > 0:
+            raise ValueError(f"Label(s) {missing} not found in mapping")
+        mapped = np.zeros_like(vertex_labels)
+        for orig, new in mapping.items():
+            mapped[vertex_labels == orig] = new
+
+        vertex_labels = mapped
 
     data_dict = dict(
         coord=coords.astype('float16'),
@@ -282,25 +299,47 @@ if __name__ == '__main__':
     parser.add_argument(
         '--voxel_size',
         type=float,
-        default=0.1,
-        help='Num workers for preprocessing.',
+        default=0.05,
+        help='Voxel size for downsampling.',
+    )
+    parser.add_argument(
+        '--no_label',
+        action='store_false',
+        help='Whether the input PLY files have labels.',
+    )
+    parser.add_argument(
+        '--ignore_deck_outlier',
+        action='store_true',
+        help='Whether to ignore deck and outlier points.',
     )
     opt = parser.parse_args()
     meta_root = Path(os.path.dirname(__file__)) / 'metadata'
 
     # Load label map
     category_mapping = pd.read_csv(
-        meta_root / 'room_label_map.txt',
+        meta_root / 'label_map.txt',
         sep='\t',
         header=None,
+        names=['orig_id', 'name']
     )
-
+    mapping = {}
+    new_id = -1
+    for row in category_mapping.itertuples(index=False):
+        if opt.ignore_deck_outlier and (row.name == 'outlier' or row.name == 'deck'):
+            mapping[row.orig_id] = -1
+        else:
+            mapping[np.int32(row.orig_id)] = new_id
+            new_id += 1
+    print("id remap", mapping)
+    train_scenes = []
+    val_scenes = []
+    test_scenes = []
     # Load train/val splits
-    with open(meta_root / 'scenes_train.txt') as train_file:
+    with open(meta_root / 'scenes_train_place.txt') as train_file:
         train_scenes = train_file.read().splitlines()
-    with open(meta_root / 'scenes_val.txt') as val_file:
+    with open(meta_root / 'scenes_val_place.txt') as val_file:
         val_scenes = val_file.read().splitlines()
-    with open(meta_root / 'scenes_test.txt') as test_file:
+    with open(meta_root / 'scenes_test_place.txt') as test_file:
         test_scenes = test_file.read().splitlines()
 
     # if opt.voxel_size:
@@ -316,7 +355,7 @@ if __name__ == '__main__':
 
     scene_paths = discover_ply_paths(opt.dataset_root)
 
-    mapping = {0: 0, 1: 1, 2: 2, 3: 0}
+    # mapping = {0: 0, 1: 1, 2: 2, 3: 0}
     # Preprocess data.
     pool = ProcessPoolExecutor(max_workers=opt.num_workers)
     print('Processing scenes...')
@@ -328,9 +367,11 @@ if __name__ == '__main__':
             repeat(mapping),
             repeat(train_scenes),
             repeat(val_scenes),
+            repeat(test_scenes),
             repeat(opt.voxel_size),
+            repeat(opt.no_label),
         )
     )
 
 # python pointcept/datasets/preprocessing/flya_ship/preprocess_flya_ship_ply.py --dataset_root ~/
-# Documents/ship_datasets/GDrive/ ~/Documents/ship_datasets/flya_cloud --output_root data/flya_ship/
+# Documents/ship_datasets/GDrive/ ~/Documents/ship_datasets/flya_cloud ~/stefano --output_root data/flya_ship/

@@ -11,8 +11,8 @@ enable_amp = True
 # model settings
 model = dict(
     type="DefaultSegmentorV2",
-    num_classes=3,
-    backbone_out_channels=1232,
+    num_classes=15,
+    backbone_out_channels=64,
     backbone=dict(
         type="PT-v3m2",
         in_channels=9,
@@ -22,6 +22,10 @@ model = dict(
         enc_channels=(48, 96, 192, 384, 512),
         enc_num_head=(3, 6, 12, 24, 32),
         enc_patch_size=(1024, 1024, 1024, 1024, 1024),
+        dec_depths=(2, 2, 2, 2),
+        dec_channels=(64, 96, 192, 384),
+        dec_num_head=(4, 6, 12, 24),
+        dec_patch_size=(1024, 1024, 1024, 1024),
         mlp_ratio=4,
         qkv_bias=True,
         qk_scale=None,
@@ -36,18 +40,18 @@ model = dict(
         upcast_softmax=False,
         traceable=False,
         mask_token=False,
-        enc_mode=True,
+        enc_mode=False,
         freeze_encoder=False,
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
         dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
     ],
-    freeze_backbone=True,
+    freeze_backbone=False,
 )
 
 # scheduler settings
-epoch = 1000
+epoch = 100
 optimizer = dict(type="AdamW", lr=0.002, weight_decay=0.02)
 scheduler = dict(
     type="OneCycleLR",
@@ -61,21 +65,33 @@ param_dicts = [dict(keyword="block", lr=0.0002)]
 
 # dataset settings
 dataset_type = "DefaultDataset"
-data_root = "data/flya_ship"
+data_root = "data/flya_ship_place"
 
 data = dict(
-    num_classes=3,
+    num_classes=15,
     ignore_index=-1,
     names=[
-        "bulk_carrier_cargo_tank",
+        "unknown",
+        "pipe",
+        "ladder",
+        "inner_bottom_plating",
+        "hopper_plating",
+        "transverse_web",
         "deck",
-        "tanker_ballast_tank",
-        "tanker_cargo_tank",
+        "inner_side_plating",
+        "bulkheads",
+        "girders",
+        "side_longs",
+        "tank_top",
+        "side_web",
+        "bllge_plating",
+        "bracket",
     ],
     train=dict(
         type=dataset_type,
         split="train",
         data_root=data_root,
+        # la_file="data/scannet/tasks/points/points20",
         transform=[
             dict(type="CenterShift", apply_z=True),
             dict(

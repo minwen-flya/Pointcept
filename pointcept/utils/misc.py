@@ -41,7 +41,13 @@ def intersection_and_union(output, target, K, ignore_index=-1):
     assert output.shape == target.shape
     output = output.reshape(output.size).copy()
     target = target.reshape(target.size)
-    output[np.where(target == ignore_index)[0]] = ignore_index
+    if np.isscalar(ignore_index):
+        output[np.where(target == ignore_index)[0]] = ignore_index
+        target[np.where(target == ignore_index)[0]] = ignore_index
+    else:
+        for idx in ignore_index:
+            output[np.where(target == idx)[0]] = idx
+            target[np.where(target == idx)[0]] = idx
     intersection = output[np.where(output == target)[0]]
     area_intersection, _ = np.histogram(intersection, bins=np.arange(K + 1))
     area_output, _ = np.histogram(output, bins=np.arange(K + 1))
@@ -53,7 +59,10 @@ def intersection_and_union(output, target, K, ignore_index=-1):
 def intersection_and_union_gpu(output, target, k, ignore_index=-1):
     # 'K' classes, output and target sizes are N or N * L or N * H * W, each value in range 0 to K - 1.
     assert output.dim() in [1, 2, 3]
+    print("output.shape", output.shape)
+    print("target.shape", target.shape)
     assert output.shape == target.shape
+
     output = output.view(-1)
     target = target.view(-1)
     output[target == ignore_index] = ignore_index

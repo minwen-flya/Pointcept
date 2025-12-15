@@ -1,0 +1,21 @@
+-1	unknown
+0	outlier
+1	pipe
+2	ladder
+3	deck
+4	bracket
+5	side shell plating
+6	inner seperate plating
+7	inner side plating
+8	inner bottom plating
+9	longitudinal web
+10	transverse web
+11	deck plating
+12	hopper plating
+13	bottom shell plating
+14	bulkheads
+15	horizontal girder
+16	longitudinals
+17	frames
+18	transverse stiffners
+19	inner ceiling plating

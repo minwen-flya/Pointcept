@@ -11,7 +11,7 @@ enable_amp = True
 # model settings
 model = dict(
     type="DefaultSegmentorV2",
-    num_classes=3,
+    num_classes=16,
     backbone_out_channels=1232,
     backbone=dict(
         type="PT-v3m2",
@@ -47,7 +47,7 @@ model = dict(
 )
 
 # scheduler settings
-epoch = 1000
+epoch = 100
 optimizer = dict(type="AdamW", lr=0.002, weight_decay=0.02)
 scheduler = dict(
     type="OneCycleLR",
@@ -61,16 +61,28 @@ param_dicts = [dict(keyword="block", lr=0.0002)]
 
 # dataset settings
 dataset_type = "DefaultDataset"
-data_root = "data/flya_ship"
+data_root = "data/flya_ship_place"
 
 data = dict(
-    num_classes=3,
+    num_classes=16,
     ignore_index=-1,
     names=[
-        "bulk_carrier_cargo_tank",
+        "unknown",
+        "pipe",
+        "ladder",
+        "inner_bottom_plating",
+        "hopper_plating",
+        "transverse_web",
         "deck",
-        "tanker_ballast_tank",
-        "tanker_cargo_tank",
+        "inner_side_plating",
+        "bulkheads",
+        "girders",
+        "side_longs",
+        "tank_top",
+        "side_web",
+        "outlier",
+        "bllge_plating",
+        "bracket"
     ],
     train=dict(
         type=dataset_type,

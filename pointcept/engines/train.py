@@ -163,6 +163,8 @@ class Trainer(TrainerBase):
                 if comm.get_world_size() > 1:
                     self.train_loader.sampler.set_epoch(self.epoch)
                 self.model.train()
+                model_mem = torch.cuda.memory_allocated() / (1024 * 1024)
+                print(f"Model already uses: {model_mem:.2f} MB")
                 self.data_iterator = enumerate(self.train_loader)
                 self.before_epoch()
                 # => run_epoch
@@ -193,6 +195,8 @@ class Trainer(TrainerBase):
             if isinstance(input_dict[key], torch.Tensor):
                 input_dict[key] = input_dict[key].cuda(non_blocking=True)
 
+        after = torch.cuda.memory_allocated() / (1024 * 1024)
+        print(f"After moving input to GPU: {after:.2f} MB")
         # Only clear gradients on first accumulation step
         if self._gradient_accumulation_counter == 0:
             self.optimizer.zero_grad()
@@ -205,14 +209,16 @@ class Trainer(TrainerBase):
             loss = (
                 output_dict["loss"] / self.cfg.gradient_accumulation_steps
             )  # scale loss
-
+        after = torch.cuda.memory_allocated() / (1024 * 1024)
+        print(f"After forward pass: {after:.2f} MB")
         # Backward pass
         if self.cfg.enable_amp:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
         self._gradient_accumulation_counter += 1
-
+        after = torch.cuda.memory_allocated() / (1024 * 1024)
+        print(f"After backward pass: {after:.2f} MB")
         # Perform optimizer step only when enough gradients have accumulated
         if self._gradient_accumulation_counter >= self.cfg.gradient_accumulation_steps:
             if self.cfg.enable_amp:
@@ -239,6 +245,9 @@ class Trainer(TrainerBase):
 
             # Reset grad accumulation counter
             self._gradient_accumulation_counter = 0
+
+        after = torch.cuda.memory_allocated() / (1024 * 1024)
+        print(f"After optimizer step: {after:.2f} MB")
 
         if self.cfg.empty_cache:
             torch.cuda.empty_cache()
@@ -311,6 +320,8 @@ class Trainer(TrainerBase):
             drop_last=len(train_data) > self.cfg.batch_size,
             persistent_workers=True,
         )
+        # train_batch = next(iter(train_loader))
+        # debug_batch("train", train_batch)
         return train_loader
 
     def build_val_loader(self):
@@ -321,6 +332,7 @@ class Trainer(TrainerBase):
                 val_sampler = torch.utils.data.distributed.DistributedSampler(val_data)
             else:
                 val_sampler = None
+            print("val batch size per gpu:", self.cfg.batch_size_val_per_gpu)
             val_loader = torch.utils.data.DataLoader(
                 val_data,
                 batch_size=self.cfg.batch_size_val_per_gpu,
@@ -330,6 +342,8 @@ class Trainer(TrainerBase):
                 sampler=val_sampler,
                 collate_fn=collate_fn,
             )
+            # val_batch = next(iter(val_loader))
+            # debug_batch("val", val_batch)
         return val_loader
 
     def build_optimizer(self):
@@ -370,3 +384,36 @@ class MultiDatasetTrainer(Trainer):
         )
         self.comm_info["iter_per_epoch"] = len(train_loader)
         return train_loader
+
+
+def batch_size_in_mb(batch):
+    def tensor_bytes(t: torch.Tensor) -> int:
+        return t.numel() * t.element_size()
+    total = 0
+
+    if isinstance(batch, torch.Tensor):
+        total += tensor_bytes(batch)
+    elif isinstance(batch, dict):
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                total += tensor_bytes(v)
+            elif isinstance(v, (list, tuple)):
+                for x in v:
+                    if isinstance(x, torch.Tensor):
+                        total += tensor_bytes(x)
+    elif isinstance(batch, (list, tuple)):
+        for v in batch:
+            if isinstance(v, torch.Tensor):
+                total += tensor_bytes(v)
+
+    return total / 1024**2  # MB
+
+
+def debug_batch(name, batch):
+    print(f"\n==== {name} batch ====")
+    if isinstance(batch, dict):
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                mb = v.numel() * v.element_size() / 1024**2
+                print(f"{k:15s} shape={tuple(v.shape)}, dtype={v.dtype}, size={mb:.2f} MB")
+    print(f"Total {name} batch size: {batch_size_in_mb(batch):.2f} MB")
