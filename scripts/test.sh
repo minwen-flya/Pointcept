@@ -83,7 +83,8 @@ echo "Running code in: $CODE_DIR"
 echo " =========> RUN TASK <========="
 ulimit -n 65536
 #$PYTHON -u "$CODE_DIR"/tools/$TEST_CODE \
-$PYTHON -u tools/$TEST_CODE \
+  $PYTHON \
+  tools/$TEST_CODE \
   --config-file "$CONFIG_DIR" \
   --num-gpus "$NUM_GPU" \
   --num-machines "$NUM_MACHINE" \
@@ -92,3 +93,7 @@ $PYTHON -u tools/$TEST_CODE \
   --options save_path="$EXP_DIR" weight="${MODEL_DIR}"/"${WEIGHT}".pth
 
 # sh scripts/test.sh -m 1 -g 1 -d sonata -c semseg-sonata-v1m1-1b-flya-lin -n semseg-sonata-v1m1-0-base-1b-flya-lin
+  # --benchmark \
+  #   -m debugpy \
+  # --listen 5678 \
+  # --wait-for-client \

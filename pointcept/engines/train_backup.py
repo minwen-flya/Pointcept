@@ -12,7 +12,6 @@ import wandb
 import torch
 import torch.nn as nn
 import torch.utils.data
-import torch.nn.functional as F
 from packaging import version
 from functools import partial
 from pathlib import Path
@@ -160,12 +159,6 @@ class Trainer(TrainerBase):
             # => before train
             self.before_train()
             self.logger.info(">>>>>>>>>>>>>>>> Start Training >>>>>>>>>>>>>>>>")
-            import os, psutil, gc, time
-            proc = psutil.Process(os.getpid())
-            def rss_mb():
-                return proc.memory_info().rss / 1024 / 1024
-            def log_mem(tag):
-                print(f"[CPU RSS] {tag}: {rss_mb():.1f} MB")
             for self.epoch in range(self.start_epoch, self.max_epoch):
                 # => before epoch
                 if comm.get_world_size() > 1:
@@ -174,61 +167,95 @@ class Trainer(TrainerBase):
                 model_mem = torch.cuda.memory_allocated() / (1024 * 1024)
                 print(f"Model already uses: {model_mem:.2f} MB")
                 self.before_epoch()
+                # => run_epoch
+                # for (
+                #     self.comm_info["iter"],
+                #     self.comm_info["input_dict"],
+                # ) in self.data_iterator:
                 for idx, data_dict in enumerate(self.train_loader):
-                    # log_mem("iter start")
                     self.comm_info["iter"] = idx
+                    # => before_step
                     self.before_step()
-                    data_dict = data_dict[0]  # batch size can only be 1 as the total number of one assets would affect the loss
+                    # => run_step
+                    data_dict = data_dict[0]  # current assume batch size is 1
                     fragment_list = data_dict.pop("fragment_list")
                     segment = data_dict.pop("segment")
-                    data_name = data_dict.pop("name")
-                    # log_mem("after build segment_global/flat_frags")
-                    # AMP
+                    if isinstance(segment, np.ndarray):
+                        segment = torch.from_numpy(segment)
+                    segment = segment.long()
+                    N = segment.numel()
+                    pred_count_cpu = torch.zeros((N,), dtype=torch.int32)
+                    for frag in fragment_list:
+                        idx = frag["index"]
+                        if isinstance(idx, np.ndarray):
+                            idx = torch.from_numpy(idx)
+                        idx = idx.long()  # CPU
+                        pred_count_cpu.index_add_(0, idx, torch.ones_like(idx, dtype=torch.int32))
+                    pred_count_cpu = pred_count_cpu.clamp_min(1)
+                    # C = self.cfg.data.num_classes
+                    # pred_logits_sum = torch.zeros((N, C), device="cpu", dtype=torch.float32)
+                    denom = float(N) 
+                    if self._gradient_accumulation_counter == 0:
+                        self.optimizer.zero_grad()
                     if version.parse(torch.__version__) >= version.parse("2.4"):
                         auto_cast = partial(torch.amp.autocast, device_type="cuda")
                     else:
+                        # deprecated warning
                         auto_cast = torch.cuda.amp.autocast
 
-                    # grad accumulation
-                    if self._gradient_accumulation_counter == 0:
-                        self.optimizer.zero_grad()
-                    N = segment.shape[0]
-                    device = torch.device("cuda")
-                    point_count = torch.zeros(
-                        (N,),
-                        device=device,
-                        dtype=torch.int32
-                    )
-                    with torch.no_grad():
-                        for frag in fragment_list:
-                            input_dict = collate_fn([frag])
-                            for k, v in input_dict.items():
-                                if torch.is_tensor(v): input_dict[k] = v.cuda(non_blocking=True)
-                            point_count.index_add_(
-                                0, input_dict["global_index"],
-                                torch.ones_like(input_dict["global_index"], dtype=torch.int32, device="cuda")
-                            )
-                    target = torch.from_numpy(segment).to("cuda", torch.long, non_blocking=True)
+                    # --- stream fragments ---
                     for i in range(len(fragment_list)):
-                        s_i, e_i = i, min(
-                            (i + 1), len(fragment_list)
-                        )
-                        input_dict = collate_fn(fragment_list[s_i:e_i])
+                        input_dict = collate_fn(fragment_list[i:i+1])
+                        idx_cpu = input_dict["index"]
+                        if isinstance(idx_cpu, np.ndarray):
+                            idx_cpu = torch.from_numpy(idx_cpu)
+                        idx_cpu = idx_cpu.long()
+                        target_cpu = segment[idx_cpu]                         # (M,)
+                        w_cpu = (1.0 / pred_count_cpu[idx_cpu].float())       # (M,)
+                        # self.comm_info["input_dict"] = input_dict
                         for key in input_dict.keys():
                             if isinstance(input_dict[key], torch.Tensor):
                                 input_dict[key] = input_dict[key].cuda(non_blocking=True)
-                        gidx = input_dict["global_index"]
-                        w = (1.0 / point_count[gidx].clamp_min(1)).to(torch.float32)
+                        target = target_cpu.cuda(non_blocking=True)
+                        w = w_cpu.cuda(non_blocking=True)
                         with auto_cast(enabled=self.cfg.enable_amp, dtype=AMP_DTYPE[self.cfg.amp_dtype]):
-                            logits = self.model.backbone(input_dict)            # (n,k)
-                            loss_per = self.model.criteria(logits, target[gidx])
-                            loss = (loss_per * w).sum() / w.sum().clamp_min(1.0)
+                            logits = self.model.backbone(input_dict)  # (M, C)
+                            loss_per = self.model.criteria(logits, target)
+                            loss = (loss_per * w).sum() / denom
                             loss = loss / self.cfg.gradient_accumulation_steps
+                        
                         if self.cfg.enable_amp:
                             self.scaler.scale(loss).backward()
                         else:
                             loss.backward()
+                        # pred_logits_part = self.model.backbone(input_dict)
+                        # idx_part = input_dict["index"]
+                        # pred_logits_part = self.model.backbone(input_dict)
+                        # bs = 0
+                        # for be in input_dict["offset"]:
+                        #     pred_logits_sum[idx_part[bs:be], :] += pred_logits_part[bs:be]
+                        #     pred_count[idx_part[bs:be]] += 1.0
+                        #     bs = be
+                    # fused_logits = pred_logits_sum / pred_count.clamp_min(1.0).unsqueeze(1)
+
+                    
+                    # # Forward pass
+                    # with auto_cast(
+                    #     enabled=self.cfg.enable_amp, dtype=AMP_DTYPE[self.cfg.amp_dtype]
+                    # ):
+                    #     loss = (
+                    #         self.model.criteria(fused_logits, (torch.from_numpy(segment)).to(device="cuda", dtype=torch.long)) / self.cfg.gradient_accumulation_steps
+                    #     )  # scale loss
+                    # after = torch.cuda.memory_allocated() / (1024 * 1024)
+                    # print(f"After forward pass: {after:.2f} MB")
+                    # # Backward pass
+                    # if self.cfg.enable_amp:
+                    #     self.scaler.scale(loss).backward()
+                    # else:
+                    #     loss.backward()
                     self._gradient_accumulation_counter += 1
+                    after = torch.cuda.memory_allocated() / (1024 * 1024)
+                    print(f"After backward pass: {after:.2f} MB")
                     # Perform optimizer step only when enough gradients have accumulated
                     if self._gradient_accumulation_counter >= self.cfg.gradient_accumulation_steps:
                         if self.cfg.enable_amp:
@@ -261,9 +288,8 @@ class Trainer(TrainerBase):
 
                     if self.cfg.empty_cache:
                         torch.cuda.empty_cache()
-                    self.comm_info["model_output_dict"] = {"loss": loss.detach()}
-                    gc.collect()
-                    # log_mem("iter end after gc")
+                    self.comm_info["model_output_dict"] = dict(loss=loss)
+                    
                     # => run_step
                     # self.run_step()
                     # => after_step
@@ -272,6 +298,76 @@ class Trainer(TrainerBase):
                 self.after_epoch()
             # => after train
             self.after_train()
+    # def run_step(self):
+    # def run_step(self):
+    #     if version.parse(torch.__version__) >= version.parse("2.4"):
+    #         auto_cast = partial(torch.amp.autocast, device_type="cuda")
+    #     else:
+    #         # deprecated warning
+    #         auto_cast = torch.cuda.amp.autocast
+
+    #     input_dict = self.comm_info["input_dict"]
+    #     for key in input_dict.keys():
+    #         if isinstance(input_dict[key], torch.Tensor):
+    #             input_dict[key] = input_dict[key].cuda(non_blocking=True)
+
+    #     after = torch.cuda.memory_allocated() / (1024 * 1024)
+    #     print(f"After moving input to GPU: {after:.2f} MB")
+    #     # Only clear gradients on first accumulation step
+    #     if self._gradient_accumulation_counter == 0:
+    #         self.optimizer.zero_grad()
+
+    #     # Forward pass
+    #     with auto_cast(
+    #         enabled=self.cfg.enable_amp, dtype=AMP_DTYPE[self.cfg.amp_dtype]
+    #     ):
+    #         output_dict = self.model(input_dict)
+    #         loss = (
+    #             output_dict["loss"] / self.cfg.gradient_accumulation_steps
+    #         )  # scale loss
+    #     after = torch.cuda.memory_allocated() / (1024 * 1024)
+    #     print(f"After forward pass: {after:.2f} MB")
+    #     # Backward pass
+    #     if self.cfg.enable_amp:
+    #         self.scaler.scale(loss).backward()
+    #     else:
+    #         loss.backward()
+    #     self._gradient_accumulation_counter += 1
+    #     after = torch.cuda.memory_allocated() / (1024 * 1024)
+    #     print(f"After backward pass: {after:.2f} MB")
+    #     # Perform optimizer step only when enough gradients have accumulated
+    #     if self._gradient_accumulation_counter >= self.cfg.gradient_accumulation_steps:
+    #         if self.cfg.enable_amp:
+    #             self.scaler.unscale_(self.optimizer)
+    #             if self.cfg.clip_grad is not None:
+    #                 torch.nn.utils.clip_grad_norm_(
+    #                     self.model.parameters(), self.cfg.clip_grad
+    #                 )
+    #             self.scaler.step(self.optimizer)
+
+    #             # When enable amp, optimizer.step call are skipped if the loss scaling factor is too large.
+    #             # Fix torch warning scheduler step before optimizer step.
+    #             scale = self.scaler.get_scale()
+    #             self.scaler.update()
+    #             if scale <= self.scaler.get_scale():
+    #                 self.scheduler.step()
+    #         else:
+    #             if self.cfg.clip_grad is not None:
+    #                 torch.nn.utils.clip_grad_norm_(
+    #                     self.model.parameters(), self.cfg.clip_grad
+    #                 )
+    #             self.optimizer.step()
+    #             self.scheduler.step()
+
+    #         # Reset grad accumulation counter
+    #         self._gradient_accumulation_counter = 0
+
+    #     after = torch.cuda.memory_allocated() / (1024 * 1024)
+    #     print(f"After optimizer step: {after:.2f} MB")
+
+    #     if self.cfg.empty_cache:
+    #         torch.cuda.empty_cache()
+    #     self.comm_info["model_output_dict"] = output_dict
 
     def after_epoch(self):
         for h in self.hooks:
@@ -365,15 +461,6 @@ class Trainer(TrainerBase):
             else:
                 val_sampler = None
             print("val batch size per gpu:", self.cfg.batch_size_val_per_gpu)
-            # val_loader = torch.utils.data.DataLoader(
-            #     val_data,
-            #     batch_size=self.cfg.batch_size_val_per_gpu,
-            #     shuffle=False,
-            #     num_workers=self.cfg.num_worker_per_gpu,
-            #     pin_memory=True,
-            #     sampler=val_sampler,
-            #     collate_fn=collate_fn,
-            # )
             val_loader = torch.utils.data.DataLoader(
                 val_data,
                 batch_size=self.cfg.batch_size_val_per_gpu,
@@ -381,7 +468,7 @@ class Trainer(TrainerBase):
                 num_workers=self.cfg.num_worker_per_gpu,
                 pin_memory=True,
                 sampler=val_sampler,
-                collate_fn=SemSegTester.collate_fn,
+                collate_fn=collate_fn,
             )
             # val_batch = next(iter(val_loader))
             # debug_batch("val", val_batch)

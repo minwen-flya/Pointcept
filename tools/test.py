@@ -24,7 +24,12 @@ def main_worker(cfg):
 def main():
     args = default_argument_parser().parse_args()
     cfg = default_config_parser(args.config_file, args.options)
-
+    if args.benchmark:
+        cfg.empty_cache = False
+        cfg.benchmark = True
+    else:
+        cfg.empty_cache = True
+        cfg.benchmark = False
     launch(
         main_worker,
         num_gpus_per_machine=args.num_gpus,

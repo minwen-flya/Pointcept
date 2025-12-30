@@ -199,10 +199,8 @@ class SemSegTester(TesterBase):
 
                     # reset peak stats for this scene
                     torch.cuda.reset_peak_memory_stats()
-                
-                N = segment.shape[0]
-                device = torch.device("cuda")
-                pred = torch.zeros((N, self.cfg.data.num_classes), dtype=torch.float32).cuda()
+
+                pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
                 for i in range(len(fragment_list)):
                     fragment_batch_size = 1
                     s_i, e_i = i * fragment_batch_size, min(
@@ -212,6 +210,7 @@ class SemSegTester(TesterBase):
                     for key in input_dict.keys():
                         if isinstance(input_dict[key], torch.Tensor):
                             input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                    idx_part = input_dict["index"]
                     with torch.no_grad():
                         if self.cfg.benchmark:
                             # --- time: model forward only ---
@@ -221,8 +220,9 @@ class SemSegTester(TesterBase):
                             torch.cuda.synchronize()
                             start_evt.record()
 
-                            logits = self.model.backbone(input_dict)  # (n, k)
-                            pred.index_add_(0, input_dict["global_index"], F.softmax(logits.to(pred.dtype)))
+                            out = self.model(input_dict)
+                            logits = out["seg_logits"]  # (n, k)
+
                             end_evt.record()
                             torch.cuda.synchronize()
                             scene_infer_ms += start_evt.elapsed_time(end_evt)
@@ -232,6 +232,7 @@ class SemSegTester(TesterBase):
                             end_evt2 = torch.cuda.Event(enable_timing=True)
                             torch.cuda.synchronize()
                             start_evt2.record()
+                            pred_part = F.softmax(logits, -1)
                             end_evt2.record()
                             torch.cuda.synchronize()
                             scene_infer_ms_softmax += start_evt2.elapsed_time(end_evt2)
@@ -240,11 +241,15 @@ class SemSegTester(TesterBase):
                             scene_peak_alloc_bytes = max(scene_peak_alloc_bytes, torch.cuda.max_memory_allocated())
                             scene_peak_reserved_bytes = max(scene_peak_reserved_bytes, torch.cuda.max_memory_reserved())
                         else:
-                            logits = self.model.backbone(input_dict)  # (n, k)
-                            pred.index_add_(0, input_dict["global_index"], F.softmax(logits, -1))
-
+                            pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
+                            pred_part = F.softmax(pred_part, -1)
+                        
                         if self.cfg.empty_cache:
                             torch.cuda.empty_cache()
+                        bs = 0
+                        for be in input_dict["offset"]:
+                            pred[idx_part[bs:be], :] += pred_part[bs:be]
+                            bs = be
 
                     logger.info(
                         "Test: {}/{}-{data_name}, Batch: {batch_idx}/{batch_num}".format(

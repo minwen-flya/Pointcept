@@ -299,7 +299,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--voxel_size',
         type=float,
-        default=0.05,
+        default=None,
         help='Voxel size for downsampling.',
     )
     parser.add_argument(

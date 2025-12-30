@@ -11,10 +11,10 @@ import torch
 import torch.distributed as dist
 import pointops
 from uuid import uuid4
-import torch.nn.functional as F
+
 import pointcept.utils.comm as comm
 from pointcept.utils.misc import intersection_and_union_gpu
-from pointcept.datasets import collate_fn
+
 from .default import HookBase
 from .builder import HOOKS
 
@@ -133,51 +133,26 @@ class SemSegEvaluator(HookBase):
         model_mem = torch.cuda.memory_allocated() / (1024 * 1024)
         print(f"Model already uses: {model_mem:.2f} MB")
         for i, input_dict in enumerate(self.trainer.val_loader):
-            input_dict = input_dict[0]
-            fragment_list = input_dict.pop("fragment_list")
-            segment = input_dict.pop("segment")
-            N = segment.shape[0]
-            device = torch.device("cuda")
-            fused_logits = torch.zeros(
-                        (N, self.trainer.cfg.data.num_classes),
-                        device=device,
-                        dtype=torch.float32
-                    )
-            point_count = torch.zeros(
-                        (N,),
-                        device=device,
-                        dtype=torch.int32
-                    )
+            for key in input_dict.keys():
+                if isinstance(input_dict[key], torch.Tensor):
+                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
+            after = torch.cuda.memory_allocated() / (1024 * 1024)
+            print(f"After moving input to GPU: {after:.2f} MB")
             with torch.no_grad():
-                for frag in fragment_list:
-                    input_dict = collate_fn([frag])
-                    for k, v in input_dict.items():
-                        if torch.is_tensor(v): input_dict[k] = v.cuda(non_blocking=True)
-                    point_count.index_add_(
-                        0, input_dict["global_index"],
-                        torch.ones_like(input_dict["global_index"], dtype=torch.int32, device="cuda")
-                    )
-            target_seg = torch.from_numpy(segment).to(device="cuda", dtype=torch.long, non_blocking=True)
-            for i in range(len(fragment_list)):
-                s_i, e_i = i, min(
-                    (i + 1), len(fragment_list)
-                )
-                input_dict = collate_fn(fragment_list[s_i:e_i])
-                for key in input_dict.keys():
-                    if isinstance(input_dict[key], torch.Tensor):
-                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
-
-                with torch.no_grad():
-                    gidx = input_dict["global_index"]
-                    w = (1.0 / point_count[gidx].clamp_min(1)).to(torch.float32)
-                    logits = self.trainer.model.backbone(input_dict)            # (n,k)
-                    fused_logits.index_add_(0, gidx, F.softmax(logits, -1))
-                    loss_per = self.trainer.model.criteria(logits, target_seg[gidx])
-                    loss = (loss_per * w).sum() / w.sum().clamp_min(1.0)
-            pred = fused_logits.max(1)[1]
+                output_dict = self.trainer.model(input_dict)
+            output = output_dict["seg_logits"]
+            after = torch.cuda.memory_allocated() / (1024 * 1024)
+            print(f"After forward pass: {after:.2f} MB")
+            loss = output_dict["loss"]
+            pred = output.max(1)[1]
+            segment = input_dict["segment"]
+            if "inverse" in input_dict.keys():
+                assert "origin_segment" in input_dict.keys()
+                pred = pred[input_dict["inverse"]]
+                segment = input_dict["origin_segment"]
             intersection, union, target = intersection_and_union_gpu(
                 pred,
-                target_seg,
+                segment,
                 self.trainer.cfg.data.num_classes,
                 self.trainer.cfg.data.ignore_index,
             )

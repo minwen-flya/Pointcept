@@ -17,7 +17,6 @@ from torchvision import transforms
 import copy
 from collections.abc import Sequence, Mapping
 from pointcept.utils.registry import Registry
-
 TRANSFORMS = Registry("transforms")
 
 
@@ -33,6 +32,7 @@ def index_operator(data_dict, index, duplicate=False):
             "strength",
             "segment",
             "instance",
+            "global_index",
         ]
     if not duplicate:
         for key in data_dict["index_valid_keys"]:
@@ -881,7 +881,8 @@ class GridSample(object):
                 np.cumsum(np.insert(count, 0, 0)[0:-1])
                 + np.random.randint(0, count.max(), count.size) % count
             )
-            idx_unique = idx_sort[idx_select]
+            idx_unique = idx_sort[idx_select]  # index in origin where every value is unique
+            data_dict["index"] = idx_unique
             if "sampled_index" in data_dict:
                 # for ScanNet data efficient, we need to make sure labeled point is sampled.
                 idx_unique = np.unique(
@@ -893,7 +894,7 @@ class GridSample(object):
             data_dict = index_operator(data_dict, idx_unique)
             if self.return_inverse:
                 data_dict["inverse"] = np.zeros_like(inverse)
-                data_dict["inverse"][idx_sort] = inverse
+                data_dict["inverse"][idx_sort] = inverse  # index with origin shape where every velue indicates which grid it belongs to
             if self.return_grid_coord:
                 data_dict["grid_coord"] = grid_coord[idx_unique]
                 if "grid_coord" not in data_dict["index_valid_keys"]:
@@ -1500,3 +1501,175 @@ class ImgAugmentation(object):
         correspondence[mask] -= np.array(self.crop_start)
         point["correspondence"] = correspondence.reshape(correspondence_shape)
         return point
+
+
+@TRANSFORMS.register_module()
+class SlidingWindowGridCrop(object):
+    """
+    Spatial sliding window crop using grid buckets (cells).
+    Ensures wide coverage (and in practice near-100% / can be strict),
+    with controllable overlap via stride_ratio.
+    """
+    def __init__(
+        self,
+        point_max=1000000,
+        cell_size=1.0,          # meters; adjust to your scene scale
+        stride_ratio=0.5,       # 0.5 => ~50% overlap in points
+        use_xy=True,            # bucket by XY (common for outdoor/indoor)
+        sort_cells="morton",    # "morton" or "scan"
+        strict_cover=True,      # True: ensure every point is included at least once
+    ):
+        self.point_max = int(point_max)
+        self.cell_size = float(cell_size)
+        self.stride_ratio = float(stride_ratio)
+        self.use_xy = bool(use_xy)
+        self.sort_cells = sort_cells
+        self.strict_cover = bool(strict_cover)
+
+    def __call__(self, data_dict):
+        assert "coord" in data_dict
+        coord = data_dict["coord"]  # (N, 3) numpy
+        N = coord.shape[0]
+        if N <= self.point_max:
+            # keep consistent return type
+            data_dict["global_index"] = np.arange(N)
+            return [data_dict]
+
+        # --- 1) assign each point to a grid cell ---
+        if self.use_xy:
+            xy = coord[:, :2]
+        else:
+            xy = coord  # use xyz (rare); would be heavier
+
+        # integer grid coords
+        g = np.floor(xy / self.cell_size).astype(np.int32)  # (N, 2) or (N, 3)
+
+        # make cell id by structured array for grouping
+        if g.shape[1] == 2:
+            key = g[:, 0].astype(np.int64) << 32 | (g[:, 1].astype(np.int64) & 0xffffffff)
+        else:
+            # xyz: pack 3 ints (slower). you can change if needed
+            key = (g[:, 0].astype(np.int64) << 42) ^ (g[:, 1].astype(np.int64) << 21) ^ g[:, 2].astype(np.int64)
+
+        # group point indices by cell key
+        order = np.argsort(key)
+        key_sorted = key[order]
+
+        # unique cells
+        cell_keys, cell_starts = np.unique(key_sorted, return_index=True)
+        cell_ends = np.r_[cell_starts[1:], len(order)]
+
+        # list of arrays: point indices (global) per cell
+        cells = [order[s:e] for s, e in zip(cell_starts, cell_ends)]
+
+        # --- 2) order cells in a spatially coherent way ---
+        # We can sort by grid coords (scanline) or morton-like (approx).
+        # For practicality and speed, we reconstruct representative grid coords per cell from packed key.
+        if g.shape[1] == 2:
+            cx = (cell_keys >> 32).astype(np.int32)
+            cy = (cell_keys & 0xffffffff).astype(np.int32)
+            if self.sort_cells == "scan":
+                cell_order = np.lexsort((cy, cx))
+            else:
+                # morton-ish: interleave bits for locality (simple, not perfect)
+                def part1by1(n):
+                    n = (n | (n << 16)) & 0x0000FFFF0000FFFF
+                    n = (n | (n << 8))  & 0x00FF00FF00FF00FF
+                    n = (n | (n << 4))  & 0x0F0F0F0F0F0F0F0F
+                    n = (n | (n << 2))  & 0x3333333333333333
+                    n = (n | (n << 1))  & 0x5555555555555555
+                    return n
+                # shift to non-negative for bit ops
+                cx0 = (cx - cx.min()).astype(np.uint64)
+                cy0 = (cy - cy.min()).astype(np.uint64)
+                morton = part1by1(cx0) | (part1by1(cy0) << 1)
+                cell_order = np.argsort(morton)
+        else:
+            # fallback for xyz
+            cell_order = np.arange(len(cells))
+
+        cells = [cells[i] for i in cell_order]
+
+        # --- 4) sliding window over cells, packing points up to point_max ---
+        stride = max(1, int(self.point_max * self.stride_ratio))
+        data_dicts_list = []
+        global_index_list = []
+
+        covered = np.zeros(N, dtype=bool) if self.strict_cover else None
+
+        cur = []
+        cur_n = 0
+
+        for pts_idx in cells:
+            m = len(pts_idx)
+            # if one cell alone is huge, we chunk it
+            if m >= self.point_max:
+                # flush current
+                if cur_n > 0:
+                    idx = np.concatenate(cur, axis=0)
+                    data_dicts_list.append(index_operator(data_dict, idx, duplicate=True))
+                    global_index_list.append(idx)
+                    if covered is not None:
+                        covered[idx] = True
+                    # overlap: keep tail
+                    keep = idx[-stride:]
+                    cur = [keep]
+                    cur_n = len(keep)
+
+                # chunk the big cell
+                for s in range(0, m, stride):
+                    chunk = pts_idx[s:s + self.point_max]
+                    if len(chunk) < self.point_max and s > 0:
+                        break
+                    data_dicts_list.append(index_operator(data_dict, chunk, duplicate=True))
+                    global_index_list.append(chunk)
+                    if covered is not None:
+                        covered[chunk] = True
+                continue
+
+            # normal case: pack cells until full
+            if cur_n + m <= self.point_max:
+                cur.append(pts_idx)
+                cur_n += m
+            else:
+                idx = np.concatenate(cur, axis=0)
+                data_dicts_list.append(index_operator(data_dict, idx, duplicate=True))
+                global_index_list.append(idx)
+                if covered is not None:
+                    covered[idx] = True
+
+                # overlap: keep last `stride` points
+                keep = idx[-stride:] if stride < len(idx) else idx
+                cur = [keep, pts_idx]
+                cur_n = len(keep) + m
+
+        # flush last
+        if cur_n > 0:
+            idx = np.concatenate(cur, axis=0)
+            # cap to point_max (just in case)
+            if len(idx) > self.point_max:
+                idx = idx[:self.point_max]
+            data_dicts_list.append(index_operator(data_dict, idx, duplicate=True))
+            global_index_list.append(idx)
+            if covered is not None:
+                covered[idx] = True
+
+        # --- 5) strict cover: add extra crops for missed points (guarantee) ---
+        if covered is not None:
+            miss = np.where(~covered)[0]
+            if miss.size > 0:
+                # make extra crops by grouping missed points in spatial order
+                # (simple: take them as-is, then pad by nearest neighbors if needed)
+                perm = miss  # already in index order; you can also sort by coord
+                for s in range(0, perm.size, stride):
+                    idx = perm[s:s + self.point_max]
+                    if idx.size < self.point_max:
+                        # pad with random already-covered points to fill to point_max (optional)
+                        pad = np.random.choice(N, self.point_max - idx.size, replace=False)
+                        idx = np.concatenate([idx, pad])
+                    data_dicts_list.append(index_operator(data_dict, idx, duplicate=True))
+                    global_index_list.append(idx)
+                    covered[idx] = True
+        for data_dicts, global_index in zip(data_dicts_list, global_index_list):
+            data_dicts["global_index"] = global_index
+        return data_dicts_list

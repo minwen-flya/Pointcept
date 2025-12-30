@@ -182,27 +182,8 @@ class SemSegTester(TesterBase):
                 pred = np.load(pred_save_path)
                 if "origin_segment" in data_dict.keys():
                     segment = data_dict["origin_segment"]
-                if self.cfg.benchmark:
-                    # --- benchmark accumulators (per scene) ---
-                    scene_infer_ms = 0.0
-                    scene_infer_ms_softmax = 0.0
-                    scene_peak_alloc_bytes = 0
-                    scene_peak_reserved_bytes = 0
-                    logger.info( f"Benchmark-{data_name}: loaded existing prediction, skipping inference. Meaningless benchmark" )
             else:
-                if self.cfg.benchmark:
-                    # --- benchmark accumulators (per scene) ---
-                    scene_infer_ms = 0.0
-                    scene_infer_ms_softmax = 0.0
-                    scene_peak_alloc_bytes = 0
-                    scene_peak_reserved_bytes = 0
-
-                    # reset peak stats for this scene
-                    torch.cuda.reset_peak_memory_stats()
-                
-                N = segment.shape[0]
-                device = torch.device("cuda")
-                pred = torch.zeros((N, self.cfg.data.num_classes), dtype=torch.float32).cuda()
+                pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
                 for i in range(len(fragment_list)):
                     fragment_batch_size = 1
                     s_i, e_i = i * fragment_batch_size, min(
@@ -212,39 +193,16 @@ class SemSegTester(TesterBase):
                     for key in input_dict.keys():
                         if isinstance(input_dict[key], torch.Tensor):
                             input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                    idx_part = input_dict["index"]
                     with torch.no_grad():
-                        if self.cfg.benchmark:
-                            # --- time: model forward only ---
-                            start_evt = torch.cuda.Event(enable_timing=True)
-                            end_evt = torch.cuda.Event(enable_timing=True)
-
-                            torch.cuda.synchronize()
-                            start_evt.record()
-
-                            logits = self.model.backbone(input_dict)  # (n, k)
-                            pred.index_add_(0, input_dict["global_index"], F.softmax(logits.to(pred.dtype)))
-                            end_evt.record()
-                            torch.cuda.synchronize()
-                            scene_infer_ms += start_evt.elapsed_time(end_evt)
-
-                            # --- optional: include softmax timing separately ---
-                            start_evt2 = torch.cuda.Event(enable_timing=True)
-                            end_evt2 = torch.cuda.Event(enable_timing=True)
-                            torch.cuda.synchronize()
-                            start_evt2.record()
-                            end_evt2.record()
-                            torch.cuda.synchronize()
-                            scene_infer_ms_softmax += start_evt2.elapsed_time(end_evt2)
-
-                            # --- memory: peak within this scene (bytes) ---
-                            scene_peak_alloc_bytes = max(scene_peak_alloc_bytes, torch.cuda.max_memory_allocated())
-                            scene_peak_reserved_bytes = max(scene_peak_reserved_bytes, torch.cuda.max_memory_reserved())
-                        else:
-                            logits = self.model.backbone(input_dict)  # (n, k)
-                            pred.index_add_(0, input_dict["global_index"], F.softmax(logits, -1))
-
+                        pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
+                        pred_part = F.softmax(pred_part, -1)
                         if self.cfg.empty_cache:
                             torch.cuda.empty_cache()
+                        bs = 0
+                        for be in input_dict["offset"]:
+                            pred[idx_part[bs:be], :] += pred_part[bs:be]
+                            bs = be
 
                     logger.info(
                         "Test: {}/{}-{data_name}, Batch: {batch_idx}/{batch_num}".format(
@@ -321,29 +279,10 @@ class SemSegTester(TesterBase):
             intersection_meter.update(intersection)
             union_meter.update(union)
             target_meter.update(target)
-            if self.cfg.benchmark:
-                # --- store benchmark results for this scene ---
-                record[data_name] = dict(
-                    intersection=intersection, union=union, target=target,
-                    infer_ms=scene_infer_ms,
-                    infer_ms_softmax=scene_infer_ms_softmax,
-                    peak_alloc_bytes=scene_peak_alloc_bytes,
-                    peak_reserved_bytes=scene_peak_reserved_bytes,
-                    num_points=int(segment.size),
-                    num_fragments=len(fragment_list),
-                )
-                logger.info(
-                    f"Benchmark-{data_name}: "
-                    f"forward {scene_infer_ms:.2f} ms, "
-                    f"softmax {scene_infer_ms_softmax:.2f} ms, "
-                    f"peak_alloc {scene_peak_alloc_bytes/1024**2:.1f} MiB, "
-                    f"peak_reserved {scene_peak_reserved_bytes/1024**2:.1f} MiB"
-                )
-                
-            else:
-                record[data_name] = dict(
-                    intersection=intersection, union=union, target=target
-                )
+            record[data_name] = dict(
+                intersection=intersection, union=union, target=target
+            )
+
             mask = union != 0
             iou_class = intersection / (union + 1e-10)
             iou = np.mean(iou_class[mask])
@@ -385,26 +324,6 @@ class SemSegTester(TesterBase):
             )
             union = np.sum([meters["union"] for _, meters in record.items()], axis=0)
             target = np.sum([meters["target"] for _, meters in record.items()], axis=0)
-            if self.cfg.benchmark:
-                # --- summarize benchmark results over all scenes ---
-                infer_ms_all = np.array([m["infer_ms"] for m in record.values()], dtype=np.float64)
-                softmax_ms_all = np.array([m["infer_ms_softmax"] for m in record.values()], dtype=np.float64)
-                peak_alloc_all = np.array([m["peak_alloc_bytes"] for m in record.values()], dtype=np.float64)
-                peak_reserved_all = np.array([m["peak_reserved_bytes"] for m in record.values()], dtype=np.float64)
-                points_all = np.array([m["num_points"] for m in record.values()], dtype=np.float64)
-                logger.info(
-                    "Benchmark summary: "
-                    f"forward(ms) mean/median/p95 = "
-                    f"{infer_ms_all.mean():.2f}/{np.median(infer_ms_all):.2f}/{np.percentile(infer_ms_all,95):.2f}, "
-                    f"softmax(ms) mean = {softmax_ms_all.mean():.2f}, "
-                    f"peak_alloc(MiB) mean/max = {peak_alloc_all.mean()/1024**2:.1f}/{peak_alloc_all.max()/1024**2:.1f}, "
-                    f"peak_reserved(MiB) mean/max = {peak_reserved_all.mean()/1024**2:.1f}/{peak_reserved_all.max()/1024**2:.1f}"
-                )
-                total_points = points_all.sum()
-                total_sec = infer_ms_all.sum() / 1000.0
-                if total_sec > 0:
-                    logger.info(f"Throughput: {total_points/total_sec:.0f} points/s (forward only)")
-
 
             if self.cfg.data.test.type == "S3DISDataset":
                 torch.save(

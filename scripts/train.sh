@@ -96,7 +96,8 @@ echo " =========> RUN TASK <========="
 ulimit -n 65536
 if [ "${WEIGHT}" = "None" ]
 then
-    $PYTHON "$CODE_DIR"/tools/$TRAIN_CODE \
+    $PYTHON \
+    "$CODE_DIR"/tools/$TRAIN_CODE \
     --config-file "$CONFIG_DIR" \
     --num-gpus "$NUM_GPU" \
     --num-machines "$NUM_MACHINE" \
@@ -115,3 +116,6 @@ else
 fi
 
 #  sh scripts/train.sh -m 1 -g 1 -d sonata -c semseg-sonata-v1m1-0a-flya-lin -n semseg-sonata-v1m1-0-base-0a-flya-lin -w exp/sonata/pretrain-sonata-v1m1-0-base/model/pretrain-sonata-v1m1-0-base.pth 
+#     -m debugpy \
+  # --listen 5678 \
+  # --wait-for-client \
